@@ -1,47 +1,66 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FlatList, KeyboardAvoidingView, Platform, Text, View } from 'react-native';
 import { Button, Empty, Input, Screen, Segmented } from '../components/ui';
 import { useSettings } from '../context/SettingsContext';
+import { ChatMode as Mode, ChatState, clearChat, loadChat, Message, saveChat } from '../utils/chatHistory';
 import { stripMarkdown } from '../utils/format';
 
-type Mode = 'ask' | 'agent';
-export interface Message { id: string; role: 'user' | 'assistant' | 'error'; text: string; meta?: string }
+const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
 export default function AskScreen() {
   const { api, apiKey } = useSettings();
   const [mode, setMode] = useState<Mode>('ask');
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [chats, setChats] = useState<Record<Mode, ChatState>>({ ask: { messages: [] }, agent: { messages: [] } });
+  const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
-  const threadId = useRef<string | undefined>(undefined);
-  const nextId = useRef(0);
+  const listRef = useRef<FlatList<Message>>(null);
+  const chatsRef = useRef(chats);
+  chatsRef.current = chats;
 
-  const push = (m: Omit<Message, 'id'>) => setMessages((ms) => [...ms, { ...m, id: String(nextId.current++) }]);
+  useEffect(() => {
+    Promise.all([loadChat('ask'), loadChat('agent')]).then(([ask, agent]) => {
+      setChats({ ask, agent });
+      setLoaded(true);
+    });
+  }, []);
 
-  const switchMode = (m: Mode) => {
-    setMode(m);
-    setMessages([]);
-    threadId.current = undefined;
+  const update = (m: Mode, fn: (s: ChatState) => ChatState) =>
+    setChats((all) => {
+      const next = fn(all[m]);
+      saveChat(m, next);
+      return { ...all, [m]: next };
+    });
+
+  const push = (m: Mode, msg: Omit<Message, 'id'>) =>
+    update(m, (s) => ({ ...s, messages: [...s.messages, { ...msg, id: newId() }] }));
+
+  const reset = () => {
+    clearChat(mode);
+    setChats((all) => ({ ...all, [mode]: { messages: [] } }));
   };
+
+  const messages = chats[mode].messages;
 
   const send = async () => {
     const text = input.trim();
     if (!text || busy) return;
-    if (mode === 'ask' && text.length < 3) return push({ role: 'error', text: 'Câu hỏi cần ít nhất 3 ký tự' });
+    const m = mode;
+    if (m === 'ask' && text.length < 3) return push(m, { role: 'error', text: 'Câu hỏi cần ít nhất 3 ký tự' });
     setInput('');
-    push({ role: 'user', text });
+    push(m, { role: 'user', text });
     setBusy(true);
     try {
-      if (mode === 'ask') {
+      if (m === 'ask') {
         const r = await api.ask(text);
-        push({ role: 'assistant', text: stripMarkdown(r.answer), meta: `${r.model} · ${(r.latency_ms / 1000).toFixed(1)}s` });
+        push(m, { role: 'assistant', text: stripMarkdown(r.answer), meta: `${r.model} · ${(r.latency_ms / 1000).toFixed(1)}s` });
       } else {
-        const r = await api.chat(text, threadId.current);
-        threadId.current = r.thread_id;
-        push({ role: 'assistant', text: stripMarkdown(r.reply), meta: `${(r.latency_ms / 1000).toFixed(1)}s` });
+        const r = await api.chat(text, chatsRef.current.agent.threadId);
+        update(m, (s) => ({ ...s, threadId: r.thread_id }));
+        push(m, { role: 'assistant', text: stripMarkdown(r.reply), meta: `${(r.latency_ms / 1000).toFixed(1)}s` });
       }
     } catch (e) {
-      push({ role: 'error', text: e instanceof Error ? e.message : 'Có lỗi xảy ra' });
+      push(m, { role: 'error', text: e instanceof Error ? e.message : 'Có lỗi xảy ra' });
     } finally {
       setBusy(false);
     }
@@ -52,19 +71,24 @@ export default function AskScreen() {
   return (
     <Screen>
       <KeyboardAvoidingView className="flex-1" behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={90}>
-        <View className="px-4 pt-3">
-          <Segmented
-            value={mode}
-            onChange={switchMode}
-            options={[{ value: 'ask', label: 'Hỏi đáp' }, { value: 'agent', label: 'Trợ lý' }]}
-          />
+        <View className="flex-row items-center gap-2 px-4 pt-3">
+          <View className="flex-1">
+            <Segmented
+              value={mode}
+              onChange={setMode}
+              options={[{ value: 'ask', label: 'Hỏi đáp' }, { value: 'agent', label: 'Trợ lý' }]}
+            />
+          </View>
+          <Button testID="chat-reset" label="Mới" variant="ghost" onPress={reset} disabled={busy || messages.length === 0} />
         </View>
         <FlatList
+          ref={listRef}
           className="flex-1"
           data={messages}
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
           keyExtractor={(m) => m.id}
           contentContainerClassName="p-4 gap-3"
-          ListEmptyComponent={
+          ListEmptyComponent={!loaded ? undefined :
             <Empty message={mode === 'ask' ? 'Đặt câu hỏi về Kinh Thánh' : 'Trò chuyện với trợ lý — có thể nhờ tìm câu, mở đoạn, lưu ghi chú'} />
           }
           renderItem={({ item }) => (
